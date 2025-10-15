@@ -1,0 +1,354 @@
+# SquidProxy Security Copilot Plugin
+# Plugin personalizado para análisis de logs SquidProxy_CL usando consultas en lenguaje natural
+# Versión: 1.0 MVP
+# Fecha: 15 de octubre de 2025
+
+Descriptor:
+  Name: SquidProxyAnalyzer
+  DisplayName: SquidProxy Log Analyzer
+  Description: |
+    Plugin personalizado para Security Copilot que permite realizar consultas en lenguaje natural 
+    sobre logs de SquidProxy_CL en Microsoft Sentinel. Parsea automáticamente los datos embebidos 
+    en RawData para extraer IPs, tipos de túnel, dominios, errores y otros elementos relevantes.
+    
+    Capacidades:
+    - Análisis temporal de conexiones proxy
+    - Identificación de errores y patrones sospechosos  
+    - Extracción automática de IPs, dominios y tipos de conexión
+    - Búsquedas por fecha, cliente IP, tipo de resultado y URL
+    - Detección de tráfico Microsoft vs externo
+    
+  # Configuración de conexión a Sentinel
+  Settings:
+    - Name: TenantId
+      Label: Tenant ID
+      Description: ID del tenant de Azure AD donde está el workspace de Sentinel
+      HintText: "ej: 12345678-1234-1234-1234-123456789abc"
+      SettingType: String
+      Required: true
+    - Name: SubscriptionId  
+      Label: Subscription ID
+      Description: ID de la suscripción de Azure donde está el workspace de Sentinel
+      HintText: "ej: 12345678-1234-1234-1234-123456789abc"
+      SettingType: String
+      Required: true
+    - Name: ResourceGroupName
+      Label: Resource Group Name
+      Description: Nombre del Resource Group que contiene el workspace de Sentinel
+      HintText: "ej: rg-sentinel-prod"
+      SettingType: String
+      Required: true
+    - Name: WorkspaceName
+      Label: Workspace Name
+      Description: Nombre del workspace de Microsoft Sentinel
+      HintText: "ej: sentinel-workspace-prod"
+      SettingType: String
+      Required: true
+
+SkillGroups:
+  - Format: KQL
+    Skills:
+      # Skill 1: Consulta general con parseo completo
+      - Name: AnalyzeSquidProxyEvents
+        DisplayName: Analyze SquidProxy Events  
+        Description: |
+          Realiza análisis completo de eventos SquidProxy_CL con parseo automático de RawData.
+          Convierte timestamps epoch a datetime legible y extrae todos los campos embebidos.
+          Soporta filtros por fecha, IP, tipo de resultado, dominio y método.
+        Inputs:
+          - Name: timeframe
+            Description: Marco temporal para la búsqueda (ej. "last 24 hours", "15 octubre 2025", "between 10am and 2pm today")
+            Required: false
+            DefaultValue: "24h"
+          - Name: client_ip
+            Description: IP del cliente a filtrar (ej. "10.60.0.10")
+            Required: false
+          - Name: result_status
+            Description: Tipo de resultado a filtrar (ej. "TCP_TUNNEL", "NONE_NONE", "TCP_MISS")
+            Required: false  
+          - Name: domain_filter
+            Description: Dominio o URL a filtrar (ej. "microsoft.com", "azure.com")
+            Required: false
+          - Name: limit
+            Description: Número máximo de resultados a retornar
+            Required: false
+            DefaultValue: "100"
+        Settings:
+          Target: Sentinel
+          TenantId: '{{TenantId}}'
+          SubscriptionId: '{{SubscriptionId}}'
+          ResourceGroupName: '{{ResourceGroupName}}'
+          WorkspaceName: '{{WorkspaceName}}'
+          Template: |-
+            let timeFilter = case(
+              "{{timeframe}}" contains "24h" or "{{timeframe}}" contains "24 hour", ago(24h),
+              "{{timeframe}}" contains "1h" or "{{timeframe}}" contains "1 hour", ago(1h),
+              "{{timeframe}}" contains "12h" or "{{timeframe}}" contains "12 hour", ago(12h),
+              "{{timeframe}}" contains "7d" or "{{timeframe}}" contains "7 day", ago(7d),
+              ago(24h)  // default
+            );
+            SquidProxy_CL
+            | where TimeGenerated >= timeFilter
+            | extend ParsedData = split(RawData, " ")
+            | extend 
+                // Convertir timestamp epoch a datetime legible
+                EpochTimestamp = todouble(ParsedData[0]),
+                SquidDateTime = unixtime_seconds_todatetime(todouble(ParsedData[0])),
+                // Extraer campos del log de Squid
+                Duration_ms = toint(ParsedData[1]),
+                ClientIP = tostring(ParsedData[2]),
+                ResultStatus = tostring(ParsedData[3]), 
+                Bytes = toint(ParsedData[4]),
+                Method = tostring(ParsedData[5]),
+                URL = tostring(ParsedData[6]),
+                User = tostring(ParsedData[7]),
+                Hierarchy = tostring(ParsedData[8]),
+                ContentType = tostring(ParsedData[9])
+            | extend
+                // Clasificaciones adicionales
+                ConnectionType = case(
+                    ResultStatus startswith "TCP_TUNNEL", "HTTPS Tunnel",
+                    ResultStatus startswith "TCP_MISS", "Cache Miss", 
+                    ResultStatus startswith "TCP_MEM_HIT", "Memory Cache Hit",
+                    ResultStatus startswith "TCP_REFRESH", "Cache Refresh",
+                    ResultStatus startswith "NONE_NONE", "Connection Error",
+                    "Other"
+                ),
+                IsMicrosoftDomain = case(
+                    URL contains "microsoft.com" or URL contains "azure.com" or 
+                    URL contains "msappproxy.net" or URL contains "microsoftonline.com" or
+                    URL contains "atp.azure.com", true,
+                    false
+                ),
+                Domain = extract(@"([^:/]+\.[^:/]+)", 1, URL),
+                IsError = case(
+                    ResultStatus contains "400" or ResultStatus contains "403" or 
+                    ResultStatus contains "500" or ResultStatus contains "503" or
+                    ResultStatus contains "NONE_NONE", true,
+                    false
+                )
+            // Aplicar filtros opcionales
+            | where case(
+                isnotempty("{{client_ip}}"), ClientIP == "{{client_ip}}", 
+                true
+            )
+            | where case(
+                isnotempty("{{result_status}}"), ResultStatus contains "{{result_status}}", 
+                true
+            )
+            | where case(
+                isnotempty("{{domain_filter}}"), URL contains "{{domain_filter}}" or Domain contains "{{domain_filter}}", 
+                true
+            )
+            | project 
+                TimeGenerated,
+                SquidDateTime,           // Timestamp convertido
+                ClientIP,
+                ResultStatus,
+                ConnectionType,
+                Duration_ms,
+                Bytes,
+                Method,
+                URL,
+                Domain,
+                IsMicrosoftDomain,
+                IsError,
+                RawData
+            | order by SquidDateTime desc
+            | limit toint("{{limit}}")
+
+      # Skill 2: Análisis de errores específicos
+      - Name: AnalyzeSquidProxyErrors
+        DisplayName: Analyze SquidProxy Errors
+        Description: |
+          Identifica y analiza errores en los logs de SquidProxy_CL.
+          Detecta conexiones fallidas, errores de servidor y patrones sospechosos.
+        Inputs:
+          - Name: timeframe
+            Description: Marco temporal para la búsqueda
+            Required: false
+            DefaultValue: "24h"
+          - Name: error_threshold
+            Description: Número mínimo de errores por IP para considerar sospechoso
+            Required: false
+            DefaultValue: "5"
+        Settings:
+          Target: Sentinel
+          TenantId: '{{TenantId}}'
+          SubscriptionId: '{{SubscriptionId}}'
+          ResourceGroupName: '{{ResourceGroupName}}'
+          WorkspaceName: '{{WorkspaceName}}'
+          Template: |-
+            let timeFilter = case(
+              "{{timeframe}}" contains "24h", ago(24h),
+              "{{timeframe}}" contains "1h", ago(1h),
+              "{{timeframe}}" contains "12h", ago(12h),
+              "{{timeframe}}" contains "7d", ago(7d),
+              ago(24h)
+            );
+            SquidProxy_CL
+            | where TimeGenerated >= timeFilter
+            | extend ParsedData = split(RawData, " ")
+            | extend 
+                SquidDateTime = unixtime_seconds_todatetime(todouble(ParsedData[0])),
+                ClientIP = tostring(ParsedData[2]),
+                ResultStatus = tostring(ParsedData[3]),
+                URL = tostring(ParsedData[6])
+            | where ResultStatus contains "400" or ResultStatus contains "403" or 
+                    ResultStatus contains "500" or ResultStatus contains "503" or
+                    ResultStatus contains "NONE_NONE"
+            | extend ErrorType = case(
+                ResultStatus contains "NONE_NONE", "Connection Error",
+                ResultStatus contains "400", "Bad Request",
+                ResultStatus contains "403", "Forbidden", 
+                ResultStatus contains "500" or ResultStatus contains "503", "Server Error",
+                "Other Error"
+            )
+            | summarize 
+                ErrorCount = count(),
+                ErrorTypes = make_set(ResultStatus),
+                LatestError = max(SquidDateTime),
+                FirstError = min(SquidDateTime),
+                AffectedURLs = make_set(URL)
+              by ClientIP, ErrorType
+            | where ErrorCount >= toint("{{error_threshold}}")
+            | order by ErrorCount desc
+
+      # Skill 3: Análisis de tráfico por cliente
+      - Name: AnalyzeClientTraffic
+        DisplayName: Analyze Client Traffic Patterns
+        Description: |
+          Analiza patrones de tráfico por IP de cliente incluyendo volumen,
+          destinos únicos, errores y actividad temporal.
+        Inputs:
+          - Name: client_ip
+            Description: IP específica del cliente a analizar (opcional)
+            Required: false
+          - Name: timeframe
+            Description: Marco temporal para el análisis
+            Required: false
+            DefaultValue: "24h"
+          - Name: top_clients
+            Description: Número de clientes más activos a mostrar
+            Required: false
+            DefaultValue: "10"
+        Settings:
+          Target: Sentinel
+          TenantId: '{{TenantId}}'
+          SubscriptionId: '{{SubscriptionId}}'
+          ResourceGroupName: '{{ResourceGroupName}}'
+          WorkspaceName: '{{WorkspaceName}}'
+          Template: |-
+            let timeFilter = case(
+              "{{timeframe}}" contains "24h", ago(24h),
+              "{{timeframe}}" contains "1h", ago(1h),
+              "{{timeframe}}" contains "12h", ago(12h),
+              "{{timeframe}}" contains "7d", ago(7d),
+              ago(24h)
+            );
+            SquidProxy_CL
+            | where TimeGenerated >= timeFilter
+            | extend ParsedData = split(RawData, " ")
+            | extend 
+                SquidDateTime = unixtime_seconds_todatetime(todouble(ParsedData[0])),
+                ClientIP = tostring(ParsedData[2]),
+                Bytes = toint(ParsedData[4]),
+                ResultStatus = tostring(ParsedData[3]),
+                URL = tostring(ParsedData[6])
+            | where case(
+                isnotempty("{{client_ip}}"), ClientIP == "{{client_ip}}", 
+                true
+            )
+            | summarize 
+                TotalConnections = count(),
+                TotalBytes = sum(Bytes),
+                UniqueDestinations = dcount(URL),
+                ErrorCount = countif(ResultStatus contains "NONE_NONE" or ResultStatus contains "400"),
+                FirstActivity = min(SquidDateTime),
+                LastActivity = max(SquidDateTime),
+                MostAccessedDomains = make_set(extract(@"([^:/]+\.[^:/]+)", 1, URL))
+              by ClientIP
+            | extend 
+                ErrorRate = round(100.0 * ErrorCount / TotalConnections, 2),
+                AvgBytesPerConnection = TotalBytes / TotalConnections,
+                ActivityDuration = LastActivity - FirstActivity
+            | order by TotalConnections desc
+            | limit toint("{{top_clients}}")
+
+      # Skill 4: Análisis de dominios y URLs
+      - Name: AnalyzeDomainActivity
+        DisplayName: Analyze Domain and URL Activity
+        Description: |
+          Analiza el tráfico por dominio identificando los destinos más populares,
+          tráfico Microsoft vs externo, y patrones de acceso sospechosos.
+        Inputs:
+          - Name: domain_pattern
+            Description: Patrón de dominio a buscar (ej. "microsoft.com", "azure")
+            Required: false
+          - Name: timeframe
+            Description: Marco temporal para el análisis
+            Required: false
+            DefaultValue: "24h"
+          - Name: include_microsoft
+            Description: Incluir tráfico a dominios Microsoft (true/false)
+            Required: false
+            DefaultValue: "true"
+        Settings:
+          Target: Sentinel
+          TenantId: '{{TenantId}}'
+          SubscriptionId: '{{SubscriptionId}}'
+          ResourceGroupName: '{{ResourceGroupName}}'
+          WorkspaceName: '{{WorkspaceName}}'
+          Template: |-
+            let timeFilter = case(
+              "{{timeframe}}" contains "24h", ago(24h),
+              "{{timeframe}}" contains "1h", ago(1h),
+              "{{timeframe}}" contains "12h", ago(12h),
+              "{{timeframe}}" contains "7d", ago(7d),
+              ago(24h)
+            );
+            SquidProxy_CL
+            | where TimeGenerated >= timeFilter
+            | extend ParsedData = split(RawData, " ")
+            | extend 
+                SquidDateTime = unixtime_seconds_todatetime(todouble(ParsedData[0])),
+                ClientIP = tostring(ParsedData[2]),
+                URL = tostring(ParsedData[6]),
+                Bytes = toint(ParsedData[4])
+            | extend Domain = extract(@"([^:/]+\.[^:/]+)", 1, URL)
+            | extend IsMicrosoftDomain = case(
+                URL contains "microsoft.com" or URL contains "azure.com" or 
+                URL contains "msappproxy.net" or URL contains "microsoftonline.com", true,
+                false
+            )
+            | where isnotempty(Domain) and Domain != "error"
+            | where case(
+                isnotempty("{{domain_pattern}}"), Domain contains "{{domain_pattern}}" or URL contains "{{domain_pattern}}", 
+                true
+            )
+            | where case(
+                "{{include_microsoft}}" == "false", IsMicrosoftDomain == false,
+                true
+            )
+            | summarize 
+                TotalConnections = count(),
+                UniqueClients = dcount(ClientIP),
+                TotalBytes = sum(Bytes),
+                FirstSeen = min(SquidDateTime),
+                LastSeen = max(SquidDateTime),
+                TopClients = make_set(ClientIP)
+              by Domain, IsMicrosoftDomain
+            | order by TotalConnections desc
+            | limit 20
+
+# Información adicional del plugin
+SupportedAuthTypes:
+  - None  # Usa la autenticación configurada en Security Copilot para Sentinel
+
+# Ejemplos de uso del plugin:
+# 1. "¿Cuántos eventos SquidProxy_CL ocurrieron el 15 de octubre de 2025?"
+# 2. "Muestra los eventos donde la IP de origen es 10.60.0.10"
+# 3. "Filtra los eventos por tipo TCP_TUNNEL en las últimas 12 horas"
+# 4. "Analiza errores de conexión en las últimas 24 horas"
+# 5. "¿Qué dominios externos se acceden más frecuentemente?"
+# 6. "Muestra el tráfico sospechoso con múltiples errores por IP"
